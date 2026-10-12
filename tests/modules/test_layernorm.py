@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -13,9 +15,36 @@ from einops import rearrange
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 from fla.modules import GroupNorm, GroupNormLinear, LayerNorm, LayerNormLinear, RMSNorm, RMSNormLinear
-from fla.modules.fused_bitlinear import activation_quant, layer_norm_linear_quant, weight_quant
+from fla.modules.fused_bitlinear import BitLinear, activation_quant, layer_norm_linear_quant, weight_quant
 from fla.modules.layernorm import GroupNormRef
 from fla.utils import assert_close, device
+
+
+@pytest.mark.parametrize("shape", [(7, 64), (2, 7, 64)], ids=["matrix", "batched"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("bias", [False, True], ids=["no-bias", "bias"])
+def test_bitlinear(shape: tuple[int, ...], dtype: torch.dtype, bias: bool):
+    torch.manual_seed(42)
+    tri = BitLinear(in_features=64, out_features=32, bias=bias).to(device=device, dtype=dtype)
+    if bias:
+        nn.init.uniform_(tri.bias, 0.5, 1.0)
+    ref = copy.deepcopy(tri)
+    tri_x = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+    ref_x = tri_x.detach().clone().requires_grad_(True)
+    x_norm = ref.norm(x=ref_x)
+    x_quant = x_norm + (activation_quant(x=x_norm) - x_norm).detach()
+    w_quant = ref.weight + (weight_quant(w=ref.weight) - ref.weight).detach()
+    ref_y = F.linear(input=x_quant, weight=w_quant, bias=ref.bias)
+    tri_y = tri(tri_x)
+    do = torch.randn_like(ref_y)
+    ref_inputs = (ref_x, ref.weight, ref.norm.weight) + ((ref.bias,) if bias else ())
+    tri_inputs = (tri_x, tri.weight, tri.norm.weight) + ((tri.bias,) if bias else ())
+    ref_grads = torch.autograd.grad(ref_y, ref_inputs, grad_outputs=do)
+    tri_grads = torch.autograd.grad(tri_y, tri_inputs, grad_outputs=do, allow_unused=True)
+    assert_close('y', ref_y, tri_y, 1e-3)
+    for name, ref_grad, tri_grad in zip(('dx', 'dw', 'dnw', 'db'), ref_grads, tri_grads):
+        assert tri_grad is not None, f'{name} is disconnected'
+        assert_close(name, ref_grad, tri_grad, 1e-3)
 
 
 @pytest.mark.parametrize("B", [2])

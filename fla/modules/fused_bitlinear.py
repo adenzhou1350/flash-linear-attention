@@ -132,7 +132,7 @@ class BitLinear(nn.Linear):
         # straight-through gradients bypass quantization
         x_quant = x_norm + (activation_quant(x=x_norm) - x_norm).detach()
         w_quant = w + (weight_quant(w=w) - w).detach()
-        y = F.linear(input=x_quant, weight=w_quant)
+        y = F.linear(input=x_quant, weight=w_quant, bias=self.bias)
 
         return y
 
